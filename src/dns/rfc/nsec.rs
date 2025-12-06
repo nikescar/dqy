@@ -26,7 +26,7 @@ pub struct NSEC {
 
     domain: DomainName,
 
-    #[from_network(with_code( self.types = TypeBitMaps::new(self.rd_length - self.domain.len() as u16); ))]
+    #[from_network(with_code( self.types = TypeBitMaps::new(self.rd_length - self.domain.size() as u16); ))]
     types: TypeBitMaps,
 }
 
