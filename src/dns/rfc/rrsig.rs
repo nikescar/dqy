@@ -62,9 +62,11 @@ impl fmt::Display for RRSIG {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {}",
             self.type_covered,
             self.algorithm,
+            self.labels,
+            self.ttl,
             self.name,
             self.sign_expiration,
             self.sign_inception,
