@@ -2,7 +2,7 @@
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use std::time::Duration;
 use clap::builder::styling;
 use clap::{crate_version, Arg, ArgAction, Command};
 use http::*;
-use log::trace;
+use log::{info, trace};
 use rustc_version_runtime::version;
 use simplelog::*;
 
@@ -21,6 +21,7 @@ use dnslib::transport::network::{IPVersion, Protocol};
 use dnslib::transport::{endpoint::EndPoint, TransportOptions};
 
 use crate::cli_options::{DnsProtocolOptions, EdnsOptions};
+use crate::config::{get_config, read_yaml};
 use crate::show::{DisplayOptions, DumpOptions};
 
 // value of the environment variable for flags if any
@@ -65,7 +66,7 @@ impl FromStr for CliOptions {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let args: Vec<_> = s.split_ascii_whitespace().map(|a| a.to_string()).collect();
-        CliOptions::options(&args)
+        CliOptions::options(&args, true)
     }
 }
 
@@ -81,7 +82,15 @@ impl CliOptions {
         }
     }
 
-    pub fn options(args: &[String]) -> dnslib::error::Result<Self> {
+    // helper func to allow unit tests with the DQY_FLAGS envvar which, if set, is set for all threads
+    #[cfg(test)]
+    fn get_test_args(args: &str) -> dnslib::error::Result<Self> {
+        let args: Vec<_> = args.split_ascii_whitespace().map(|a| a.to_string()).collect();
+        CliOptions::options(&args, false)
+    }
+
+    // the check_var is used to deal with unit tests which share the same process and so the same var
+    pub fn options(args: &[String], check_var: bool) -> dnslib::error::Result<Self> {
         // save all cli options into a structure
         let mut options = CliOptions::default();
 
@@ -90,15 +99,17 @@ impl CliOptions {
 
         // check first if DQY_FLAGS is present
         if let Ok(env) = std::env::var(ENV_FLAGS) {
-            let env_args: Vec<String> = env.split_ascii_whitespace().map(|a| a.to_string()).collect();
+            if check_var {
+                let env_args: Vec<String> = env.split_ascii_whitespace().map(|a| a.to_string()).collect();
 
-            let (env_without_dash, env_with_dash) = Self::split_args(&env_args);
-            without_dash.to_mut().extend(env_without_dash.into_owned());
-            with_dash.to_mut().extend(env_with_dash.into_owned());
+                let (env_without_dash, env_with_dash) = Self::split_args(&env_args);
+                without_dash.to_mut().extend(env_without_dash.into_owned());
+                with_dash.to_mut().extend(env_with_dash.into_owned());
+            }
         }
 
-        // println!("options without dash:{:?}", without_dash);
-        // println!("options with dash:{:?}", with_dash);
+        /*         println!("options without dash:{:?}", without_dash);
+        println!("options with dash:{:?}", with_dash); */
 
         let mut server = "";
 
@@ -166,7 +177,7 @@ Supported query types: {}
             .literal(styling::AnsiColor::Blue.on_default().bold())
             .placeholder(styling::AnsiColor::Cyan.on_default());
 
-        let cmd = Command::new("A DNS query tool inspired by dig, drill and dog")
+        let mut cmd = Command::new("A DNS query tool inspired by dig, drill and dog")
             .version(crate_version!())
             .long_version(crate_version!())
             .styles(STYLES)
@@ -181,12 +192,12 @@ Supported query types: {}
                     .short('t')
                     .long("type")
                     .long_help("Resource record type to query.")
-                    .action(ArgAction::Append)
+                    .action(ArgAction::Set)
                     .num_args(1..255)
                     .value_delimiter(',')
                     .value_name("TYPE")
                     .value_parser(validate_qtypes)
-                    .default_value("NS")
+                    //.default_value("NS")
             )
             .arg(
                 Arg::new("class")
@@ -265,6 +276,7 @@ Supported query types: {}
                 Arg::new("doq")
                     .long("doq")
                     .long_help("Sets transport to DNS over QUIC (DoQ).")
+                    .visible_aliases(["DoQ", "quic"])
                     .action(ArgAction::SetTrue)
                     .value_name("doq")
                     .help_heading("Transport options")
@@ -284,7 +296,7 @@ Supported query types: {}
                     .long("https-version")
                     .long_help("Sets the HTTPS version when using DNS over https (DoH).")
                     .action(ArgAction::Set)
-                    .value_name("https-version")
+                    .value_name("VERSION")
                     .value_parser(["v1", "v2", "v3"])
                     .default_value("v2")
                     .help_heading("Transport options")
@@ -308,9 +320,9 @@ Supported query types: {}
                     .help_heading("Transport options")
             )
             .arg(
-                Arg::new("resolve-file")
+                Arg::new("resolv-file")
                     .short('r')
-                    .long("resolve-file")
+                    .long("resolv-file")
                     .long_help("Optional resolv.conf-like file from which the resolvers are taken.")
                     .action(ArgAction::Set)
                     .value_name("RESOLV.CONF")
@@ -359,8 +371,9 @@ Supported query types: {}
                     .long("set")
                     .long_help("Sets flags in the query header.")
                     .action(ArgAction::Set)
-                    .num_args(1..=6)
+                    .num_args(1..=7)
                     .value_name("FLAGS")
+                    .value_delimiter(',')
                     .value_parser(["aa", "ad", "cd", "ra", "rd", "tc", "z"])
                     .help_heading("Transport options")
             )
@@ -371,6 +384,7 @@ Supported query types: {}
                     .action(ArgAction::Set)
                     .num_args(1..=6)
                     .value_name("FLAGS")
+                    .value_delimiter(',')
                     .value_parser(["aa", "ad", "cd", "ra", "rd", "tc", "z"])
                     .help_heading("Transport options")
             )
@@ -487,6 +501,8 @@ Supported query types: {}
                     .long("fmt")
                     .long_help("User-defined format for RR output. Specify a list of comma-separated fields. Possible values: name, type, length, class, ttl, rdata. For OPT record: payload, extcode, version, flags. Ex: -fmt 'type,name,ttl,rdata'")
                     .action(ArgAction::Set)
+                    .value_delimiter(',')
+                    .value_parser(["name","type","length","class","ttl","rdata","payload","extcode","version","flags"])                    
                     .value_name("FORMAT")
                     .help_heading("Display options")
             )
@@ -583,16 +599,16 @@ Supported query types: {}
                     .value_name("STATS")
                     .help_heading("Display options")
             )
-            .arg(
-                Arg::new("tpl")
-                    .long("tpl")
-                    .hide(true)
-                    .long_help("Name of the handlebars template to render to display results.")
-                    .action(ArgAction::Set)
-                    .value_name("TEMPLATE")
-                    .value_parser(clap::value_parser!(PathBuf))
-                    .help_heading("Display options")
-            )
+            // .arg(
+            //     Arg::new("tpl")
+            //         .long("tpl")
+            //         .hide(true)
+            //         .long_help("Name of the handlebars template to render to display results.")
+            //         .action(ArgAction::Set)
+            //         .value_name("TEMPLATE")
+            //         .value_parser(clap::value_parser!(PathBuf))
+            //         .help_heading("Display options")
+            // )
             .arg(
                 Arg::new("verbose")
                     .short('v')
@@ -614,11 +630,20 @@ Supported query types: {}
                     .help_heading("Miscellaneous options")
             )
             .arg(
+                Arg::new("cfg")
+                    .long("config")
+                    .long_help("Get default arguments from CONFIG.")
+                    .action(ArgAction::Set)
+                    .value_name("CONFIG")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .help_heading("Miscellaneous options")
+            )            
+            .arg(
                 Arg::new("list-resolvers")
                     .long("list-resolvers")
                     .long_help("Do not query but list host resolvers (with port number) found and try to connect to them.")
                     .action(ArgAction::SetTrue)
-                    .help_heading("Display options")
+                    .help_heading("Miscellaneous options")
             )
             .arg(
                 Arg::new("write-response")
@@ -642,18 +667,49 @@ Supported query types: {}
 
         // add Lua option if feature lua
         #[cfg(feature = "mlua")]
-        let cmd = cmd.arg(
-            Arg::new("lua")
-                .short('l')
-                .long("lua")
-                .long_help("Name of a lua script that will be called to display results.")
-                .action(ArgAction::Set)
-                .value_name("lua")
-                .value_parser(clap::value_parser!(PathBuf))
-                .help_heading("Display options"),
-        );
+        {
+            cmd = cmd.arg(
+                Arg::new("lua")
+                    .short('l')
+                    .long("lua")
+                    .long_help("Name of a lua script that will be called to display results.")
+                    .action(ArgAction::Set)
+                    .value_name("SCRIPT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .help_heading("Miscellaneous options"),
+            );
+        }
 
         let matches = cmd.get_matches_from(with_dash.iter());
+
+        //───────────────────────────────────────────────────────────────────────────────────
+        // do we have a configuration file ?
+        //───────────────────────────────────────────────────────────────────────────────────
+        if let Some(path) = matches.get_one::<PathBuf>("cfg") {
+            // read YAML
+            let cfg_data = read_yaml(path)?;
+
+            // set qtypes
+            options.protocol.qtype.extend(cfg_data.default_rrs);
+
+            // choose server to query
+
+
+
+        }        
+
+        //───────────────────────────────────────────────────────────────────────────────────
+        // if no args without dash are provided, try to get the YAML config
+        //───────────────────────────────────────────────────────────────────────────────────        
+        /*         if options.protocol.qtype.is_empty() {
+            // get config file from current dir or home dir
+            if let Some(cfg) = get_config() {
+                let cfg_data = read_yaml(cfg)?;
+                options.protocol.qtype = cfg_data.default_rrs;
+            } else {
+                options.protocol.qtype = vec![QType::NS];
+            }
+        } */
 
         //───────────────────────────────────────────────────────────────────────────────────
         // transport mode
@@ -691,8 +747,8 @@ Supported query types: {}
         //───────────────────────────────────────────────────────────────────────────────────
         // build the endpoint
         //───────────────────────────────────────────────────────────────────────────────────
-        // resolver file is provided using --resolve-file
-        if let Some(path) = matches.get_one::<PathBuf>("resolve-file") {
+        // resolver file is provided using --resolv-file
+        if let Some(path) = matches.get_one::<PathBuf>("resolv-file") {
             // end point is build from these
             options.transport.endpoint = EndPoint::try_from((path, options.transport.port))?;
         }
@@ -720,13 +776,21 @@ Supported query types: {}
         // std::process::exit(0);
 
         //───────────────────────────────────────────────────────────────────────────────────
-        // QTypes, QClass
+        // QTypes
         //───────────────────────────────────────────────────────────────────────────────────
         if options.protocol.qtype.is_empty() {
-            let vals: Vec<QType> = matches.get_many("type").unwrap().copied().collect();
-            options.protocol.qtype = vals;
+            if let Some(v) = matches.get_many::<QType>("type") {
+                let qtypes: Vec<_> = v.copied().collect();
+                options.protocol.qtype = qtypes;
+            } else {
+                options.protocol.qtype = vec![QType::NS];
+            }
         }
-        options.protocol.qclass = *matches.get_one::<QClass>("class").unwrap();
+
+        //───────────────────────────────────────────────────────────────────────────────────
+        // QClass
+        //───────────────────────────────────────────────────────────────────────────────────
+        options.protocol.qclass = *matches.get_one::<QClass>("class").unwrap_or(&QClass::IN);
 
         //───────────────────────────────────────────────────────────────────────────────────
         // ip versions (Any is by default)
@@ -782,26 +846,13 @@ Supported query types: {}
             // try to convert to a valid IP address
             let addr = IpAddr::from_str(ip).map_err(|e| Error::IPParse(e, ip.to_string()))?;
 
-            if addr.is_ipv4() {
-                let mut limbs: Vec<_> = ip.split('.').collect();
-                limbs.reverse();
-                options.protocol.domain_string = format!("{}.in-addr.arpa", limbs.join("."));
-            } else {
-                // get individual u8 values because an ipv6 address might omit a heading 0
-                // ex: 2001:470:30:84:e276:63ff:fe72:3900 => 2001:0470:0030:84:e276:63ff:fe72:3900
-
-                // this will convert to ["2001", "0470", "0030", "0084", "e276", "63ff", "fe72", "3900"]
-                let split = ip
-                    .split(':') // split accordsing to ":"
-                    .map(|x| format!("{:0>4}", x)) // convert to string with heading 0
-                    .collect::<Vec<String>>()
-                    .join(""); // and finally join to get a whole string
-
-                // now reverse and join each digit with .
-                let mut domain: Vec<_> = split.split("").filter(|x| !x.is_empty()).collect();
-                domain.reverse();
-
-                options.protocol.domain_string = format!("{}.ip6.arpa", domain.join("."));
+            match addr {
+                IpAddr::V4(_) => {
+                    let mut limbs: Vec<_> = ip.split('.').collect();
+                    limbs.reverse();
+                    options.protocol.domain_string = format!("{}.in-addr.arpa", limbs.join("."));
+                }
+                IpAddr::V6(ipv6) => options.protocol.domain_string = ipv6_to_arpa(ipv6),
             }
         }
 
@@ -874,11 +925,11 @@ Supported query types: {}
         options.display.puny = matches.get_flag("puny");
 
         // handlebars template
-        if let Some(path) = matches.get_one::<PathBuf>("tpl") {
-            // read handlebars file as a string
-            options.display.hb_tpl =
-                Some(std::fs::read_to_string(path).map_err(|e| Error::OpenFile(e, path.to_path_buf()))?);
-        }
+        // if let Some(path) = matches.get_one::<PathBuf>("tpl") {
+        //     // read handlebars file as a string
+        //     options.display.hb_tpl =
+        //         Some(std::fs::read_to_string(path).map_err(|e| Error::OpenFile(e, path.to_path_buf()))?);
+        // }
 
         //───────────────────────────────────────────────────────────────────────────────────
         // manage misc. options
@@ -909,8 +960,9 @@ Supported query types: {}
             std::env::set_var("NO_COLOR", "1");
         }
 
-        if let Some(fmt) = matches.get_one::<String>("fmt") {
-            options.display.fmt = fmt.to_string();
+        // gather format string
+        if let Some(v) = matches.get_many::<String>("fmt") {
+            options.display.fmt = v.map(|f| f.to_string()).collect();
         }
 
         //───────────────────────────────────────────────────────────────────────────────────
@@ -943,7 +995,7 @@ Supported query types: {}
         #[cfg(feature = "mlua")]
         if let Some(path) = matches.get_one::<PathBuf>("lua") {
             // open Lua script and load code
-            let code = std::fs::read_to_string(path)?;
+            let code = std::fs::read_to_string(path).map_err(|e| Error::OpenFile(e, path.to_path_buf()))?;
             trace!("using Lua code from {}", path.display());
             options.display.lua_code = Some(code);
         }
@@ -1049,10 +1101,27 @@ fn init_term_logger(level: log::LevelFilter) -> dnslib::error::Result<()> {
     Ok(())
 }
 
+// reverse ipv6 address to nibbles (for PTR)
+fn ipv6_to_arpa(addr: Ipv6Addr) -> String {
+    addr.segments() // get individual segments of the ipv6 address
+        .iter()
+        .map(|seg| format!("{:04x}", seg)) // pad with zeros
+        .collect::<Vec<String>>() // expand to ["2001","0db8","0000","0000","0000","0000","0000","0001"]
+        .join("") // join to get a string: "20010db8000000000000000000000001"
+        .chars() // get individual chars
+        .rev() // reverse the vector
+        .map(|c| c.to_string()) // convert each char to a string
+        .collect::<Vec<String>>() //create the vector
+        .join(".")
+        + ".ip6.arpa" // join each string (which is one char) with a dot
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use dnslib::dns::rfc::domain::ROOT;
+    use dnslib::{dns::rfc::domain::ROOT};
+
 
     #[test]
     fn _split_args() {
@@ -1079,11 +1148,8 @@ mod tests {
     }
 
     #[test]
-    fn empty() {
-        let opts = CliOptions::from_str("");
-        println!("opts={:?}", opts);
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+    fn empty() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("")?;
 
         assert_eq!(opts.protocol.qtype, vec![QType::NS]);
         assert_eq!(opts.protocol.qclass, QClass::IN);
@@ -1091,27 +1157,423 @@ mod tests {
         assert_eq!(&opts.protocol.domain_string, ROOT);
         assert_eq!(opts.transport.ip_version, IPVersion::Any);
         assert_eq!(opts.transport.transport_mode, Protocol::Udp);
+
+        assert!(!opts.transport.alpn);
+        assert!(opts.edns.cookie.is_none());
+        assert!(opts.edns.padding.is_none());
+        assert!(!opts.edns.dnssec);
+        assert!(!opts.edns.no_opt);
+        assert!(!opts.edns.nsid);
+        assert!(!opts.edns.zoneversion);
+
+        assert!(!opts.display.align_names);
+        assert!(opts.display.fmt.is_empty());
+
+        Ok(())
+    }
+
+    //───────────────────────────────────────────────────────────────────────────────────
+    // Main options
+    //───────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn qtype() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("A aaaa MX")?;
+        assert_eq!(opts.protocol.qtype, vec![QType::A, QType::AAAA, QType::MX]);
+
+        let opts = CliOptions::get_test_args("-t A,aaaa,MX")?;
+        assert_eq!(opts.protocol.qtype, vec![QType::A, QType::AAAA, QType::MX]);
+
+        let opts = CliOptions::get_test_args("--type A,aaaa,MX")?;
+        assert_eq!(opts.protocol.qtype, vec![QType::A, QType::AAAA, QType::MX]);
+
+        Ok(())
     }
 
     #[test]
-    fn with_domain1() {
-        let opts = CliOptions::from_str("-d www.google.com");
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+    fn qclass() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-c CH")?;
+        assert_eq!(opts.protocol.qclass, QClass::CH);
 
-        assert_eq!(opts.protocol.qtype, vec![QType::NS]);
+        Ok(())
+    }
+
+    #[test]
+    fn trace() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--trace")?;
+        assert!(opts.display.trace);
+
+        Ok(())
+    }
+
+    #[test]
+    fn ptr() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--ptr 192.0.2.1")?;
+        assert_eq!(opts.protocol.qtype, vec![QType::PTR]);
         assert_eq!(opts.protocol.qclass, QClass::IN);
-        assert_eq!(opts.transport.port, 53);
-        assert_eq!(&opts.protocol.domain_string, "www.google.com");
-        assert_eq!(opts.transport.ip_version, IPVersion::Any);
-        assert_eq!(opts.transport.transport_mode, Protocol::Udp);
+        assert_eq!(&opts.protocol.domain_string, "1.2.0.192.in-addr.arpa");
+
+        let opts = CliOptions::get_test_args("-x 192.0.2.1")?;
+        assert_eq!(&opts.protocol.domain_string, "1.2.0.192.in-addr.arpa");
+
+        let opts = CliOptions::get_test_args("--ptr 2001:db8::567:89ab")?;
+        assert_eq!(
+            &opts.protocol.domain_string,
+            "b.a.9.8.7.6.5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa"
+        );
+
+        Ok(())
+    }
+
+    //───────────────────────────────────────────────────────────────────────────────────
+    // Transport options
+    //───────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn ipv4() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-4")?;
+        assert_eq!(opts.transport.ip_version, IPVersion::V4);
+
+        let opts = CliOptions::get_test_args("--ipv4")?;
+        assert_eq!(opts.transport.ip_version, IPVersion::V4);
+
+        Ok(())
     }
 
     #[test]
-    fn with_domain2() {
-        let opts = CliOptions::from_str("-t AAAA -c CH -d www.google.com");
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+    fn ipv6() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-6")?;
+        assert_eq!(opts.transport.ip_version, IPVersion::V6);
+
+        let opts = CliOptions::get_test_args("--ipv6")?;
+        assert_eq!(opts.transport.ip_version, IPVersion::V6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn tcp() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-T")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::Tcp);
+
+        let opts = CliOptions::get_test_args("--tcp")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::Tcp);
+
+        Ok(())
+    }
+
+    #[test]
+    fn https() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-H")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoH);
+        assert_eq!(opts.transport.https_version, Some(version::Version::HTTP_2));
+
+        let opts = CliOptions::get_test_args("--https")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoH);
+
+        let opts = CliOptions::get_test_args("--doh")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoH);
+
+        let opts = CliOptions::get_test_args("--DoH")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoH);
+
+        Ok(())
+    }
+
+    #[test]
+    fn https_version() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-H --https-version v1")?;
+        assert_eq!(opts.transport.https_version, Some(version::Version::HTTP_11));
+
+        let opts = CliOptions::get_test_args("-H --https-version v2")?;
+        assert_eq!(opts.transport.https_version, Some(version::Version::HTTP_2));
+
+        let opts = CliOptions::get_test_args("-H --https-version v3")?;
+        assert_eq!(opts.transport.https_version, Some(version::Version::HTTP_3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn tls() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-S")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoT);
+
+        let opts = CliOptions::get_test_args("--tls")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoT);
+
+        let opts = CliOptions::get_test_args("--dot")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoT);
+
+        let opts = CliOptions::get_test_args("--DoT")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoT);
+
+        Ok(())
+    }
+
+    #[test]
+    fn quic() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--doq")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoQ);
+
+        let opts = CliOptions::get_test_args("--DoQ")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoQ);
+
+        let opts = CliOptions::get_test_args("--quic")?;
+        assert_eq!(opts.transport.transport_mode, Protocol::DoQ);
+
+        Ok(())
+    }
+
+    #[test]
+    fn alpn() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--alpn")?;
+        assert!(opts.transport.alpn);
+
+        Ok(())
+    }
+
+    #[test]
+    fn port() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-p 1000")?;
+        assert_eq!(opts.transport.port, 1000);
+
+        let opts = CliOptions::get_test_args("--port=1000")?;
+        assert_eq!(opts.transport.port, 1000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_recurse() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--no-recurse")?;
+        assert!(!opts.flags.recursion_desired);
+
+        Ok(())
+    }
+
+    #[test]
+    fn timeout() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--timeout=5000")?;
+        assert_eq!(opts.transport.timeout, Duration::from_millis(5000));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sni() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--sni www.foo.sni")?;
+        assert_eq!(&opts.transport.endpoint.sni.unwrap(), "www.foo.sni");
+
+        Ok(())
+    }
+
+    #[test]
+    fn set_flags() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--set aa,ad,cd,ra,rd,tc,z")?;
+
+        assert!(opts.flags.authorative_answer);
+        assert!(opts.flags.authentic_data);
+        assert!(opts.flags.checking_disabled);
+        assert!(opts.flags.recursion_available);
+        assert!(opts.flags.recursion_desired);
+        assert!(opts.flags.truncation);
+        assert!(opts.flags.z);
+
+        Ok(())
+    }
+
+    #[test]
+    fn unset_flags() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--unset aa,ad,cd,ra,rd,tc,z")?;
+
+        assert!(!opts.flags.authorative_answer);
+        assert!(!opts.flags.authentic_data);
+        assert!(!opts.flags.checking_disabled);
+        assert!(!opts.flags.recursion_available);
+        assert!(!opts.flags.recursion_desired);
+        assert!(!opts.flags.truncation);
+        assert!(!opts.flags.z);
+
+        Ok(())
+    }
+
+    //───────────────────────────────────────────────────────────────────────────────────
+    // EDNS options
+    //───────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn bufsize() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--bufsize 4096")?;
+
+        assert_eq!(opts.transport.bufsize, 4096);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cookie() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("")?;
+        assert!(opts.edns.cookie.is_none());
+
+        let opts = CliOptions::get_test_args("--cookie")?;
+        assert!(opts.edns.cookie.is_some());
+
+        let opts = CliOptions::get_test_args("--cookie=ABCDEF")?;
+        assert_eq!(opts.edns.cookie.unwrap(), "ABCDEF");
+
+        Ok(())
+    }
+
+    #[test]
+    fn dnssec() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--dnssec")?;
+
+        assert!(opts.edns.dnssec);
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_opt() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--no-opt")?;
+
+        assert!(opts.edns.no_opt);
+
+        Ok(())
+    }
+
+    #[test]
+    fn nsid() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--nsid")?;
+
+        assert!(opts.edns.nsid);
+
+        Ok(())
+    }
+
+    #[test]
+    fn padding() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--padding 20")?;
+
+        assert_eq!(opts.edns.padding, Some(20));
+
+        Ok(())
+    }
+
+    #[test]
+    fn zoneversion() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--zoneversion")?;
+
+        assert!(opts.edns.zoneversion);
+
+        Ok(())
+    }
+
+    //───────────────────────────────────────────────────────────────────────────────────
+    // Display options
+    //───────────────────────────────────────────────────────────────────────────────────
+    #[test]
+    fn align() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--align")?;
+
+        assert!(opts.display.align_names);
+
+        Ok(())
+    }
+
+    #[test]
+    fn format() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--fmt name,type,length,class,ttl,rdata,payload,extcode,version")?;
+
+        assert_eq!(
+            opts.display.fmt,
+            vec!["name", "type", "length", "class", "ttl", "rdata", "payload", "extcode", "version"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn header() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--headers")?;
+
+        assert!(opts.display.show_headers);
+
+        Ok(())
+    }
+
+    #[test]
+    fn puny() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--puny")?;
+
+        assert!(opts.display.puny);
+
+        Ok(())
+    }
+
+    #[test]
+    fn json() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--json")?;
+        assert!(opts.display.json);
+
+        let opts = CliOptions::get_test_args("-j")?;
+        assert!(opts.display.json);
+
+        let opts = CliOptions::get_test_args("--json-pretty")?;
+        assert!(opts.display.json_pretty);
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_colors() -> dnslib::error::Result<()> {
+        let _ = CliOptions::get_test_args("--no-colors")?;
+
+        match std::env::var("NO_COLOR") {
+            Ok(val) => assert_eq!(&val, "1"),
+            Err(_) => assert!(false),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn question() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--question")?;
+
+        assert!(opts.display.show_question);
+
+        Ok(())
+    }
+
+    #[test]
+    fn raw_ttl() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--raw-ttl")?;
+
+        assert!(opts.display.raw_ttl);
+
+        Ok(())
+    }
+
+    #[test]
+    fn short() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--short")?;
+
+        assert!(opts.display.short);
+
+        Ok(())
+    }
+
+    #[test]
+    fn stats() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("--stats")?;
+
+        assert!(opts.display.stats);
+
+        Ok(())
+    }
+
+    #[test]
+    fn with_class() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("-t AAAA -c CH -d www.google.com")?;
 
         assert_eq!(opts.protocol.qtype, vec![QType::AAAA]);
         assert_eq!(opts.protocol.qclass, QClass::CH);
@@ -1119,13 +1581,13 @@ mod tests {
         assert_eq!(&opts.protocol.domain_string, "www.google.com");
         assert_eq!(opts.transport.ip_version, IPVersion::Any);
         assert_eq!(opts.transport.transport_mode, Protocol::Udp);
+
+        Ok(())
     }
 
     #[test]
-    fn with_no_dash() {
-        let opts = CliOptions::from_str("@1.1.1.1 A AAAA MX www.google.com");
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+    fn with_no_dash() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("@1.1.1.1 A AAAA MX www.google.com")?;
 
         assert_eq!(opts.protocol.qtype, vec![QType::A, QType::AAAA, QType::MX]);
         assert_eq!(opts.protocol.qclass, QClass::IN);
@@ -1134,13 +1596,13 @@ mod tests {
         assert_eq!(opts.transport.ip_version, IPVersion::Any);
         assert_eq!(opts.transport.transport_mode, Protocol::Udp);
         assert_eq!(&opts.transport.endpoint.server_name, "1.1.1.1");
+
+        Ok(())
     }
 
     #[test]
-    fn with_ipv6() {
-        let opts = CliOptions::from_str("@2606:4700:4700::1111 A AAAA MX www.google.com -6");
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+    fn with_ipv6() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("@2606:4700:4700::1111 A AAAA MX www.google.com -6")?;
 
         assert_eq!(opts.protocol.qtype, vec![QType::A, QType::AAAA, QType::MX]);
         assert_eq!(opts.protocol.qclass, QClass::IN);
@@ -1148,14 +1610,14 @@ mod tests {
         assert_eq!(&opts.protocol.domain_string, "www.google.com");
         assert_eq!(opts.transport.ip_version, IPVersion::V6);
         assert_eq!(opts.transport.transport_mode, Protocol::Udp);
-        assert_eq!(&opts.transport.endpoint.server_name, &"2606:4700:4700::1111");
+        assert_eq!(&opts.transport.endpoint.server_name, "2606:4700:4700::1111");
+
+        Ok(())
     }
 
     #[test]
-    fn with_tcp() {
-        let opts = CliOptions::from_str("@2606:4700:4700::1111 A AAAA MX www.google.com --tcp -6");
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+    fn with_tcp() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("@2606:4700:4700::1111 A AAAA MX www.google.com --tcp -6")?;
 
         assert_eq!(opts.protocol.qtype, vec![QType::A, QType::AAAA, QType::MX]);
         assert_eq!(opts.protocol.qclass, QClass::IN);
@@ -1163,13 +1625,13 @@ mod tests {
         assert_eq!(&opts.protocol.domain_string, "www.google.com");
         assert_eq!(opts.transport.ip_version, IPVersion::V6);
         assert_eq!(opts.transport.transport_mode, Protocol::Tcp);
+
+        Ok(())
     }
 
     #[test]
-    fn with_ptr() {
-        let opts = CliOptions::from_str("@1.1.1.1 A AAAA MX www.google.com -4 --tcp -x 1.2.3.4");
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+    fn with_ptr() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("@1.1.1.1 A AAAA MX www.google.com -4 --tcp -x 1.2.3.4")?;
 
         assert_eq!(opts.protocol.qtype, vec![QType::PTR]);
         assert_eq!(opts.protocol.qclass, QClass::IN);
@@ -1177,33 +1639,48 @@ mod tests {
         assert_eq!(&opts.protocol.domain_string, "4.3.2.1.in-addr.arpa");
         assert_eq!(opts.transport.ip_version, IPVersion::V4);
         assert_eq!(opts.transport.transport_mode, Protocol::Tcp);
+
+        Ok(())
     }
 
     #[test]
-    fn plus() {
-        let opts = CliOptions::from_str("@1.1.1.1 A www.google.com --dnssec --set cd --unset aa");
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+    fn with_dnssec() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("@1.1.1.1 A www.google.com --dnssec --set cd --unset aa")?;
 
         assert!(opts.edns.dnssec);
         assert!(opts.flags.checking_disabled);
         assert!(!opts.flags.authorative_answer);
+
+        Ok(())
     }
 
-    //#[test]
-    fn with_env() {
+    #[test]
+    fn with_env() -> dnslib::error::Result<()> {
         std::env::set_var("DQY_FLAGS", "@1.1.1.1 --dnssec");
 
-        let opts = CliOptions::from_str("www.google.com --set cd --unset aa");
-        assert!(opts.is_ok());
-        let opts = opts.unwrap();
+        // in this case, due to envvar collision, we don't use from_str and set check_var to false
+        // to not check DQY_FLAGS
+        let args: Vec<_> = "www.google.com --set cd --unset aa"
+            .split_ascii_whitespace()
+            .map(|a| a.to_string())
+            .collect();
+        let opts = CliOptions::options(&args, true)?;
 
         assert_eq!(&opts.transport.endpoint.server_name, "1.1.1.1");
+        assert!(opts.edns.dnssec);
+        assert!(opts.flags.checking_disabled);
+        assert!(!opts.flags.authorative_answer);
 
-        std::env::set_var("DQY_FLAGS", "");
+        std::env::remove_var("DQY_FLAGS");        
 
-        // assert!(opts.edns.dnssec);
-        // assert!(opts.flags.checking_disabled);
-        // assert!(!opts.flags.authorative_answer);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "mlua")]
+    fn lua() -> dnslib::error::Result<()> {
+        let opts = CliOptions::get_test_args("@1.1.1.1 A www.google.com --lua tests/sample.lua")?;
+
+        Ok(())        
     }
 }
