@@ -25,13 +25,15 @@ pub enum ResponseSection {
     Additional,
 }
 
-#[derive(Debug, Default, Serialize, ToNetwork)]
+#[derive(Debug, Default, Serialize)]
 pub struct Response {
     pub header: Header,
     pub question: Question,
     pub answer: Option<RRList>,
     authority: Option<RRList>,
     additional: Option<RRList>,
+    #[serde(skip)]
+    raw_bytes: Option<Vec<u8>>,
 }
 
 // hide internal fields
@@ -76,6 +78,12 @@ impl Response {
         self.header.set_response_code(rc);
     }
 
+    /// Get the raw binary DNS response bytes (if stored)
+    #[inline]
+    pub fn raw_bytes(&self) -> Option<&[u8]> {
+        self.raw_bytes.as_deref()
+    }
+
     // referral response means no answer
     #[inline]
     pub fn is_referral(&self) -> bool {
@@ -115,6 +123,9 @@ impl Response {
         debug!("received {} bytes", received);
         trace!("received buffer {:X?}", &buffer[..received]);
 
+        // Store raw bytes for DNSSEC passthrough
+        self.raw_bytes = Some(buffer[..received].to_vec());
+
         // if using TCP, we get rid of 2 bytes which are the length of the message received
         let mut cursor = Cursor::new(&buffer[..received]);
 
@@ -146,6 +157,9 @@ impl Response {
         let received = trp.arecv(buffer).await?;
         debug!("received {} bytes", received);
         trace!("received buffer {:X?}", &buffer[..received]);
+
+        // Store raw bytes for DNSSEC passthrough
+        self.raw_bytes = Some(buffer[..received].to_vec());
 
         // if using TCP, we get rid of 2 bytes which are the length of the message received
         let mut cursor = Cursor::new(&buffer[..received]);
@@ -251,6 +265,26 @@ impl From<&Query> for Response {
         r.header.ar_count = 0;
 
         r
+    }
+}
+
+// Manual implementation to skip raw_bytes field
+impl ToNetworkOrder for Response {
+    fn serialize_to(&self, buffer: &mut Vec<u8>) -> std::io::Result<usize> {
+        let mut bytes_written = 0;
+        bytes_written += self.header.serialize_to(buffer)?;
+        bytes_written += self.question.serialize_to(buffer)?;
+        if let Some(ref answer) = self.answer {
+            bytes_written += answer.serialize_to(buffer)?;
+        }
+        if let Some(ref authority) = self.authority {
+            bytes_written += authority.serialize_to(buffer)?;
+        }
+        if let Some(ref additional) = self.additional {
+            bytes_written += additional.serialize_to(buffer)?;
+        }
+        // raw_bytes is intentionally skipped
+        Ok(bytes_written)
     }
 }
 
